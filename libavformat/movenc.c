@@ -3306,7 +3306,15 @@ static int mov_write_stbl_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContext
         mov_write_stss_tag(pb, track, MOV_SYNC_SAMPLE);
     if (track->par->codec_type == AVMEDIA_TYPE_VIDEO && track->has_disposable && track->entry)
         mov_write_sdtp_tag(pb, track);
-    if (track->mode == MODE_MOV && track->flags & MOV_TRACK_STPS)
+    /* `stps` originates in QuickTime, but Apple's own AVAssetWriter emits it
+     * into .mp4 as well -- verified 2026-09-06 by porting a MOV carrying
+     * `stps` through AVAssetWriter to MP4 and reading the box back out, with
+     * playback identical. Restricting it to MODE_MOV left MP4 with no way to
+     * describe an open-GOP entry point at all, and the alternative (dropping
+     * those samples from `stss`) made an AVPlayer start 5.9 s into a 6 s clip
+     * because CRA-only ranged material then has almost no entry points left.
+     * A parser that does not know `stps` skips it, as with any unknown box. */
+    if (track->flags & MOV_TRACK_STPS)
         mov_write_stss_tag(pb, track, MOV_PARTIAL_SYNC_SAMPLE);
     if (track->par->codec_type == AVMEDIA_TYPE_VIDEO &&
         track->flags & MOV_TRACK_CTTS && track->entry) {
@@ -6194,6 +6202,100 @@ static int mov_write_identification(AVIOContext *pb, AVFormatContext *s)
     return 0;
 }
 
+/* Returns 1 once a picture-carrying NAL settles the question.
+ * H.264: only an IDR (type 5) is a full sync sample; any other slice that was
+ * flagged as a keyframe is an open-GOP recovery point.
+ * HEVC: IDR_W_RADL/IDR_N_LP and the BLA family are self-contained; CRA is not,
+ * because its RASL leading pictures reference across the boundary. */
+static int mov_h26x_vcl_flags(int type, int is_hevc, uint32_t *flags)
+{
+    if (is_hevc) {
+        if (type >= 16 && type <= 20) { *flags = MOV_SYNC_SAMPLE;         return 1; }
+        if (type == 21)               { *flags = MOV_PARTIAL_SYNC_SAMPLE; return 1; }
+        if (type <= 9)                { *flags = MOV_PARTIAL_SYNC_SAMPLE; return 1; }
+        return 0;
+    }
+    if (type == 5) { *flags = MOV_SYNC_SAMPLE;         return 1; }
+    if (type == 1) { *flags = MOV_PARTIAL_SYNC_SAMPLE; return 1; }
+    return 0;
+}
+
+/* An H.264/HEVC packet flagged as a keyframe is not necessarily an
+ * independently decodable one. Blu-ray and broadcast encoders emit open-GOP
+ * recovery points -- a non-IDR I picture whose leading B pictures reference
+ * the GOP before it -- and demuxers flag those as keyframes because they are
+ * legitimate random access points. Listing them in stss tells a player they
+ * can be entered cold, which is false: entering there shows one broken
+ * picture. QuickTime's stps ("partial sync") box exists for exactly this, and
+ * movenc already uses it for MPEG-2 via mov_parse_mpeg2_frame.
+ *
+ * Measured on a Blu-ray H.264 remux: 606 stss entries against 200 true IDRs.
+ * Final Cut Pro decodes long-GOP media in parallel segments beginning at sync
+ * samples, so it entered at a recovery point and rendered one macroblocked
+ * frame at a fixed timecode. Routing those to stps instead fixed it while
+ * keeping seek granularity, both confirmed in Final Cut.
+ *
+ * Only the first VCL NAL matters. The packet is length-prefixed when the
+ * extradata is avcC/hvcC (the stream-copy case) and Annex B otherwise, so
+ * both framings are handled. */
+static void mov_parse_h26x_frame(AVPacket *pkt, MOVTrack *trk, uint32_t *flags)
+{
+    int is_hevc = trk->par->codec_id == AV_CODEC_ID_HEVC;
+    int nal_len_size = 4;
+    int annexb = 0;
+    int i;
+
+    if (pkt->size < 5)
+        return;
+
+    /* avcC/hvcC extradata begins with configurationVersion == 1 and carries
+     * the NAL length size; anything else means Annex B start codes. */
+    if (trk->par->extradata_size > (is_hevc ? 22 : 5) &&
+        trk->par->extradata[0] == 1) {
+        nal_len_size = is_hevc ? (trk->par->extradata[21] & 3) + 1
+                               : (trk->par->extradata[4]  & 3) + 1;
+    } else {
+        annexb = 1;
+    }
+    /* Trust the framing, not the extradata: an MXF source can carry avcC
+     * extradata while the packets are still Annex B. Both start-code lengths
+     * count -- checking only the 4-byte form let a Canon XF remux through
+     * with the parser silently giving up, which leaves the sample marked as a
+     * full sync sample and defeats the whole change. */
+    if (!annexb && pkt->size > 4 &&
+        (AV_RB32(pkt->data) == 1 || AV_RB24(pkt->data) == 1))
+        annexb = 1;
+
+    if (annexb) {
+        uint32_t state = -1;
+        for (i = 0; i < pkt->size - 1; i++) {
+            state = (state << 8) | pkt->data[i];
+            if ((state & 0xFFFFFF) == 1) {
+                int type = is_hevc ? (pkt->data[i + 1] >> 1) & 0x3F
+                                   :  pkt->data[i + 1] & 0x1F;
+                if (mov_h26x_vcl_flags(type, is_hevc, flags))
+                    return;
+            }
+        }
+        return;
+    }
+
+    for (i = 0; i + nal_len_size < pkt->size;) {
+        int len = 0, j, type;
+        for (j = 0; j < nal_len_size; j++)
+            len = (len << 8) | pkt->data[i + j];
+        if (len <= 0 || i + nal_len_size >= pkt->size)
+            return;
+        type = is_hevc ? (pkt->data[i + nal_len_size] >> 1) & 0x3F
+                       :  pkt->data[i + nal_len_size] & 0x1F;
+        if (mov_h26x_vcl_flags(type, is_hevc, flags))
+            return;
+        if (len > pkt->size - i - nal_len_size)
+            return;
+        i += nal_len_size + len;
+    }
+}
+
 static int mov_parse_mpeg2_frame(AVPacket *pkt, uint32_t *flags)
 {
     uint32_t c = -1;
@@ -7053,6 +7155,25 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
             mov_parse_mpeg2_frame(pkt, &trk->cluster[trk->entry].flags);
             if (trk->cluster[trk->entry].flags & MOV_PARTIAL_SYNC_SAMPLE)
                 trk->flags |= MOV_TRACK_STPS;
+        } else if (trk->entry > 0 &&
+                   (par->codec_id == AV_CODEC_ID_H264 ||
+                    par->codec_id == AV_CODEC_ID_HEVC)) {
+            // Same reasoning as MPEG-2 above: an open-GOP recovery point is a
+            // partial sync sample, not a full one. Entry 0 keeps the
+            // unconditional sync flag so a file always has one true entry.
+            trk->cluster[trk->entry].flags = MOV_SYNC_SAMPLE;
+            mov_parse_h26x_frame(pkt, trk, &trk->cluster[trk->entry].flags);
+            if (trk->cluster[trk->entry].flags & MOV_PARTIAL_SYNC_SAMPLE)
+                trk->flags |= MOV_TRACK_STPS;
+            /* MP4 is deliberately left alone. `stps` is a QuickTime box and
+             * ISO BMFF has no equivalent players agree on, so the only way to
+             * stop over-promising there is to drop the picture from the sync
+             * table entirely -- which was tried, and made an AVPlayer start
+             * 6.1 s late on a file with an edit list (the R-15 behaviour in
+             * PITFALLS 6d, where playback begins at the *second* sync
+             * sample). Trading a one-frame artifact for six seconds of
+             * missing head is a worse deal. MOV is the container to
+             * recommend for editing; MP4 keeps its previous behaviour. */
         } else {
             trk->cluster[trk->entry].flags = MOV_SYNC_SAMPLE;
         }
