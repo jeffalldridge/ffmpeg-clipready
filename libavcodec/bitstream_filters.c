@@ -39,6 +39,7 @@ extern const FFBitStreamFilter ff_eac3_core_bsf;
 extern const FFBitStreamFilter ff_eia608_to_smpte436m_bsf;
 extern const FFBitStreamFilter ff_evc_frame_merge_bsf;
 extern const FFBitStreamFilter ff_extract_extradata_bsf;
+extern const FFBitStreamFilter ff_drop_leading_bsf;
 extern const FFBitStreamFilter ff_filter_units_bsf;
 extern const FFBitStreamFilter ff_h264_metadata_bsf;
 extern const FFBitStreamFilter ff_h264_mp4toannexb_bsf;
