@@ -336,6 +336,7 @@ static const struct {
 } mov_codec_ch_layouts[] = {
     { AV_CODEC_ID_AAC,     mov_ch_layouts_aac      },
     { AV_CODEC_ID_AC3,     mov_ch_layouts_ac3      },
+    { AV_CODEC_ID_EAC3,    mov_ch_layouts_ac3      },
     { AV_CODEC_ID_ALAC,    mov_ch_layouts_alac     },
     { AV_CODEC_ID_PCM_U8,    mov_ch_layouts_wav    },
     { AV_CODEC_ID_PCM_S8,    mov_ch_layouts_wav    },
@@ -469,21 +470,30 @@ int ff_mov_get_channel_layout_tag(const AVCodecParameters *par,
     uint32_t tag = 0;
     const enum MovChannelLayoutTag *layouts = NULL;
 
-    /* find the layout list for the specified codec */
-    for (i = 0; mov_codec_ch_layouts[i].codec_id != AV_CODEC_ID_NONE; i++) {
-        if (mov_codec_ch_layouts[i].codec_id == par->codec_id)
-            break;
+    /* For standard multichannel formats where codec bitstream has defined ordering */
+    if ((par->codec_id == AV_CODEC_ID_AC3 || par->codec_id == AV_CODEC_ID_EAC3) && par->ch_layout.nb_channels == 6) {
+        tag = MOV_CH_LAYOUT_MPEG_5_1_C;
+    } else if (par->codec_id == AV_CODEC_ID_AAC && par->ch_layout.nb_channels == 6) {
+        tag = MOV_CH_LAYOUT_MPEG_5_1_D;
     }
-    if (mov_codec_ch_layouts[i].codec_id != AV_CODEC_ID_NONE)
-        layouts = mov_codec_ch_layouts[i].layouts;
 
-    if (layouts) {
-        /* find the layout tag for the specified channel layout */
-        for (i = 0; layouts[i] != 0; i++)
-            if (is_layout_valid_for_tag(&par->ch_layout, layouts[i], mov_ch_layout_map))
+    if (!tag) {
+        /* find the layout list for the specified codec */
+        for (i = 0; mov_codec_ch_layouts[i].codec_id != AV_CODEC_ID_NONE; i++) {
+            if (mov_codec_ch_layouts[i].codec_id == par->codec_id)
                 break;
+        }
+        if (mov_codec_ch_layouts[i].codec_id != AV_CODEC_ID_NONE)
+            layouts = mov_codec_ch_layouts[i].layouts;
 
-        tag = layouts[i];
+        if (layouts) {
+            /* find the layout tag for the specified channel layout */
+            for (i = 0; layouts[i] != 0; i++)
+                if (is_layout_valid_for_tag(&par->ch_layout, layouts[i], mov_ch_layout_map))
+                    break;
+
+            tag = layouts[i];
+        }
     }
 
     *layout = tag;
