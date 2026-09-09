@@ -2825,8 +2825,7 @@ static int mov_write_video_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContex
     } else if (track->extradata_size[track->last_stsd_index] > 0)
         mov_write_glbl_tag(pb, track);
 
-    if (track->par->codec_id != AV_CODEC_ID_H264 &&
-        track->par->codec_id != AV_CODEC_ID_MPEG4 &&
+    if (track->par->codec_id != AV_CODEC_ID_MPEG4 &&
         track->par->codec_id != AV_CODEC_ID_DNXHD) {
         int field_order = track->par->field_order;
 
