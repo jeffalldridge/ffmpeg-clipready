@@ -475,6 +475,15 @@ int ff_mov_get_channel_layout_tag(const AVCodecParameters *par,
         tag = MOV_CH_LAYOUT_MPEG_5_1_C;
     } else if (par->codec_id == AV_CODEC_ID_AAC && par->ch_layout.nb_channels == 6) {
         tag = MOV_CH_LAYOUT_MPEG_5_1_D;
+    } else if (par->codec_id == AV_CODEC_ID_ALAC && par->ch_layout.nb_channels == 6) {
+        /* The ALAC encoder emits C L R Ls Rs LFE. Upstream leaves this to a
+         * table lookup that misses on 5.1(side) and falls through to a bare
+         * bitmap, which CoreAudio normalises to MPEG_5_1_A (L R C LFE Ls Rs)
+         * -- so Apple believes channel 0 is Left while it carries Centre.
+         * Measured 2026-09-06 with a per-channel tone probe: every channel
+         * was displaced, while the named-layout check passed because it
+         * compares the label and never the content. */
+        tag = MOV_CH_LAYOUT_MPEG_5_1_D;
     }
 
     if (!tag) {
