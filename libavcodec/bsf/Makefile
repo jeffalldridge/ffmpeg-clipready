@@ -52,3 +52,5 @@ OBJS-$(CONFIG_VVC_METADATA_BSF)           += bsf/h266_metadata.o
 OBJS-$(CONFIG_VVC_MP4TOANNEXB_BSF)        += bsf/vvc_mp4toannexb.o
 
 libavcodec/bsf/%.o: CPPFLAGS += -I$(SRC_PATH)/libavcodec/
+
+OBJS-$(CONFIG_H264_PAIR_FIELDS_BSF) += bsf/h264_pair_fields.o

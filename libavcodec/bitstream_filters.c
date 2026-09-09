@@ -42,6 +42,7 @@ extern const FFBitStreamFilter ff_extract_extradata_bsf;
 extern const FFBitStreamFilter ff_drop_leading_bsf;
 extern const FFBitStreamFilter ff_filter_units_bsf;
 extern const FFBitStreamFilter ff_h264_metadata_bsf;
+extern const FFBitStreamFilter ff_h264_pair_fields_bsf;
 extern const FFBitStreamFilter ff_h264_mp4toannexb_bsf;
 extern const FFBitStreamFilter ff_h264_redundant_pps_bsf;
 extern const FFBitStreamFilter ff_hapqa_extract_bsf;
