@@ -42,6 +42,7 @@
 #include "libavcodec/dnxhddata.h"
 #include "libavcodec/flac.h"
 #include "libavcodec/get_bits.h"
+#include "libavcodec/golomb.h"
 
 #include "libavcodec/internal.h"
 #include "libavcodec/put_bits.h"
@@ -6206,16 +6207,44 @@ static int mov_write_identification(AVIOContext *pb, AVFormatContext *s)
  * flagged as a keyframe is an open-GOP recovery point.
  * HEVC: IDR_W_RADL/IDR_N_LP and the BLA family are self-contained; CRA is not,
  * because its RASL leading pictures reference across the boundary. */
-static int mov_h26x_vcl_flags(int type, int is_hevc, uint32_t *flags)
+static int mov_h264_slice_is_intra(const uint8_t *data, int size)
+{
+    uint8_t rbsp[64];
+    GetBitContext gb;
+    unsigned slice_type;
+    int i, out = 0, zeros = 0;
+
+    /* The two Exp-Golomb values we need are at the start of the slice header.
+     * Unescape a bounded prefix rather than allocating/copying the picture. */
+    for (i = 1; i < size && out < sizeof(rbsp); i++) {
+        if (zeros >= 2 && data[i] == 3) {
+            zeros = 0;
+            continue;
+        }
+        rbsp[out++] = data[i];
+        zeros = data[i] == 0 ? zeros + 1 : 0;
+    }
+    if (init_get_bits8(&gb, rbsp, out) < 0)
+        return 0;
+    get_ue_golomb_long(&gb); // first_mb_in_slice
+    slice_type = get_ue_golomb_long(&gb);
+    return slice_type <= 9 && (slice_type % 5 == 2 || slice_type % 5 == 4);
+}
+
+static int mov_h26x_vcl_flags(int type, int is_hevc,
+                              const uint8_t *data, int size, uint32_t *flags)
 {
     if (is_hevc) {
         if (type >= 16 && type <= 20) { *flags = MOV_SYNC_SAMPLE;         return 1; }
         if (type == 21)               { *flags = MOV_PARTIAL_SYNC_SAMPLE; return 1; }
-        if (type <= 9)                { *flags = MOV_PARTIAL_SYNC_SAMPLE; return 1; }
+        if (type <= 31)               { *flags = 0;                       return 1; }
         return 0;
     }
     if (type == 5) { *flags = MOV_SYNC_SAMPLE;         return 1; }
-    if (type == 1) { *flags = MOV_PARTIAL_SYNC_SAMPLE; return 1; }
+    if (type == 1) {
+        *flags = mov_h264_slice_is_intra(data, size) ? MOV_PARTIAL_SYNC_SAMPLE : 0;
+        return 1;
+    }
     return 0;
 }
 
@@ -6272,7 +6301,9 @@ static void mov_parse_h26x_frame(AVPacket *pkt, MOVTrack *trk, uint32_t *flags)
             if ((state & 0xFFFFFF) == 1) {
                 int type = is_hevc ? (pkt->data[i + 1] >> 1) & 0x3F
                                    :  pkt->data[i + 1] & 0x1F;
-                if (mov_h26x_vcl_flags(type, is_hevc, flags))
+                if (mov_h26x_vcl_flags(type, is_hevc,
+                                       pkt->data + i + 1, pkt->size - i - 1,
+                                       flags))
                     return;
             }
         }
@@ -6285,11 +6316,12 @@ static void mov_parse_h26x_frame(AVPacket *pkt, MOVTrack *trk, uint32_t *flags)
             len = (len << 8) | pkt->data[i + j];
         if (len <= 0 || i + nal_len_size >= pkt->size)
             return;
+        if (len > pkt->size - i - nal_len_size)
+            return;
         type = is_hevc ? (pkt->data[i + nal_len_size] >> 1) & 0x3F
                        :  pkt->data[i + nal_len_size] & 0x1F;
-        if (mov_h26x_vcl_flags(type, is_hevc, flags))
-            return;
-        if (len > pkt->size - i - nal_len_size)
+        if (mov_h26x_vcl_flags(type, is_hevc,
+                               pkt->data + i + nal_len_size, len, flags))
             return;
         i += nal_len_size + len;
     }
@@ -7148,31 +7180,28 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
         mov_parse_vc1_frame(pkt, trk);
     } else if (par->codec_id == AV_CODEC_ID_TRUEHD) {
         mov_parse_truehd_frame(pkt, trk);
+    } else if (par->codec_id == AV_CODEC_ID_H264 ||
+               par->codec_id == AV_CODEC_ID_HEVC) {
+        /* Container key flags are incomplete on real AVCHD: ffmpeg reports
+         * only the opening IDR while Final Cut indexes every later non-IDR
+         * I-picture as partial sync. Parse every access unit so MOV keeps the
+         * useful recovery points even when the demuxer did not flag them. */
+        trk->cluster[trk->entry].flags =
+            pkt->flags & AV_PKT_FLAG_KEY ? MOV_SYNC_SAMPLE : 0;
+        if (trk->entry == 0)
+            trk->cluster[trk->entry].flags = MOV_SYNC_SAMPLE;
+        else
+            mov_parse_h26x_frame(pkt, trk, &trk->cluster[trk->entry].flags);
+        if (trk->cluster[trk->entry].flags & MOV_PARTIAL_SYNC_SAMPLE)
+            trk->flags |= MOV_TRACK_STPS;
+        if (trk->cluster[trk->entry].flags & MOV_SYNC_SAMPLE)
+            trk->has_keyframes++;
     } else if (pkt->flags & AV_PKT_FLAG_KEY) {
         if (mov->mode == MODE_MOV && par->codec_id == AV_CODEC_ID_MPEG2VIDEO &&
             trk->entry > 0) { // force sync sample for the first key frame
             mov_parse_mpeg2_frame(pkt, &trk->cluster[trk->entry].flags);
             if (trk->cluster[trk->entry].flags & MOV_PARTIAL_SYNC_SAMPLE)
                 trk->flags |= MOV_TRACK_STPS;
-        } else if (trk->entry > 0 &&
-                   (par->codec_id == AV_CODEC_ID_H264 ||
-                    par->codec_id == AV_CODEC_ID_HEVC)) {
-            // Same reasoning as MPEG-2 above: an open-GOP recovery point is a
-            // partial sync sample, not a full one. Entry 0 keeps the
-            // unconditional sync flag so a file always has one true entry.
-            trk->cluster[trk->entry].flags = MOV_SYNC_SAMPLE;
-            mov_parse_h26x_frame(pkt, trk, &trk->cluster[trk->entry].flags);
-            if (trk->cluster[trk->entry].flags & MOV_PARTIAL_SYNC_SAMPLE)
-                trk->flags |= MOV_TRACK_STPS;
-            /* MP4 is deliberately left alone. `stps` is a QuickTime box and
-             * ISO BMFF has no equivalent players agree on, so the only way to
-             * stop over-promising there is to drop the picture from the sync
-             * table entirely -- which was tried, and made an AVPlayer start
-             * 6.1 s late on a file with an edit list (the R-15 behaviour in
-             * PITFALLS 6d, where playback begins at the *second* sync
-             * sample). Trading a one-frame artifact for six seconds of
-             * missing head is a worse deal. MOV is the container to
-             * recommend for editing; MP4 keeps its previous behaviour. */
         } else {
             trk->cluster[trk->entry].flags = MOV_SYNC_SAMPLE;
         }
